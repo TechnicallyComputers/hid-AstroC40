@@ -5,7 +5,8 @@ I have not yet tested this with a dongle, I don't own one to test, but I have on
 Use DKMS to install kernel module driver for Astro C40 based on the official playstation controller driver named hid-playstation.  
   
 ```
-cd hid-astroc40-dkmssudo dkms add -m hid-astroc40 -v 1.0sudo dkms build -m hid-astroc40 -v 1.0sudo dkms install -m hid-astroc40 -v 1.0  
+cd hid-astroc40
+sudo dkms add -m hid-astroc40 -v 1.0sudo dkms build -m hid-astroc40 -v 1.0sudo dkms install -m hid-astroc40 -v 1.0  
 ```
 Or in one step:  
 
