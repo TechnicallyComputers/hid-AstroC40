@@ -3,22 +3,52 @@ This driver enables all the features benefitted to an official DS4 controller on
 I have not yet tested this with a dongle, I don't own one to test, but I have one being delivered.
 
 Use DKMS to install kernel module driver for Astro C40 based on the official playstation controller driver named hid-playstation.  
-  
-```
-cd hid-astroc40
-sudo dkms add -m hid-astroc40 -v 1.0sudo dkms build -m hid-astroc40 -v 1.0sudo dkms install -m hid-astroc40 -v 1.0  
-```
-Or in one step:  
-
-```  
-sudo dkms install -m hid-astroc40 -v 1.0  
-```
-Check  
-
-```
-dkms statuslsmod | grep hid_astroc40
-```
 
 This work was also constructed through research thanks to [ds4drv](https://github.com/chrippa/ds4drv), [evtest-qt](https://github.com/Grumbel/evtest-qt), [antimicrox](https://github.com/AntiMicroX/antimicrox), and [sc-controller](https://github.com/kozec/sc-controller).
 
 This project was built with Cursor AI.
+
+# hid-astroc40-dkms
+
+Standalone HID kernel driver for the **Astro C40 TR** controller. Builds via DKMS without kernel source modifications.
+
+## Features
+
+- Gamepad (sticks, D-pad, face buttons, triggers, Share, Options, L3/R3, PS)
+- Touchpad (2-finger, DS4-compatible layout)
+- Motion sensors (gyro + accelerometer)
+- Rumble (force feedback)
+- Battery power_supply (capacity/status; parsing from reports not yet implemented)
+
+## Requirements
+
+- Linux kernel headers for your running kernel
+- DKMS
+
+## Install
+
+```bash
+# From the package directory
+sudo dkms add .
+sudo dkms install hid-astroc40/1.0
+```
+
+Or install the package (e.g. `hid-astroc40-dkms`) if provided as a distro package.
+
+## Manual build (without DKMS)
+
+```bash
+make
+sudo insmod hid-astroc40.ko
+```
+
+## Supported devices
+
+- USB VID 0x9886 (Astro Gaming), PID 0x0024
+- USB VID 0x9886 (Astro Gaming), PID 0x0025
+
+## Uninstall
+
+```bash
+sudo dkms remove hid-astroc40/1.0 --all
+```
