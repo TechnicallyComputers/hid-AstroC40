@@ -15,7 +15,7 @@ Standalone HID kernel driver for the **Astro C40 TR** controller. Builds via DKM
 ## Features
 
 - Gamepad (sticks, D-pad, face buttons, triggers, Share, Options, L3/R3, PS)
-- Touchpad (2-finger, DS4-compatible layout)
+- Touchpad (2-finger support, native Linux desktop trackpad features & behaviour)
 - Motion sensors (gyro + accelerometer)
 - Rumble (force feedback)
 - Battery power_supply (capacity/status; parsing from reports not yet implemented)
