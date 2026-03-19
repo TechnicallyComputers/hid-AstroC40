@@ -2,26 +2,30 @@
 /*
  *  HID driver for Astro C40 TR controller.
  *
- *  DS4-compatible mapping, touchpad, motion sensors (gyro+accel at bytes 13-24).
+ *  Gamepad, touchpad, motion sensors (gyro+accel), rumble.
  *  Mapping reference: ds4drv/ds4drv/backends/hidraw.py HidrawAstroC40Device.
  */
 #include <linux/bits.h>
 #include <linux/device.h>
 #include <linux/hid.h>
 #include <linux/idr.h>
+#include <linux/input.h>
 #include <linux/input/mt.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
+#include <linux/power_supply.h>
+#include <linux/string.h>
 #include <linux/unaligned.h>
 #include <linux/usb.h>
+#include <linux/workqueue.h>
 #include "hid-ids.h"
 
 #define C40_DEVICE_NAME "Astro C40 TR"
 static DEFINE_MUTEX(c40_devices_lock);
 static LIST_HEAD(c40_devices_list);
 static DEFINE_IDA(c40_player_id_allocator);
-/* Base class for playstation devices. */
-struct ps_device {
+
+struct c40_base_device {
 	struct list_head list;
 	struct hid_device *hdev;
 	spinlock_t lock;
@@ -30,13 +34,11 @@ struct ps_device {
 	struct power_supply *battery;
 	uint8_t battery_capacity;
 	int battery_status;
-	uint8_t mac_address[6]; /* Note: stored in little endian order. */
-	uint32_t hw_version;
-	uint32_t fw_version;
-	int (*parse_report)(struct ps_device *dev, struct hid_report *report, u8 *data, int size);
+	uint8_t mac_address[6];
+	int (*parse_report)(struct c40_base_device *dev, struct hid_report *report, u8 *data, int size);
 };
-/* Calibration data for playstation motion sensors. */
-struct ps_calibration_data {
+
+struct c40_calibration_data {
 	int abs_code;
 	short bias;
 	int sens_numer;
@@ -48,53 +50,43 @@ struct ps_calibration_data {
 /* C40 touchpad: header bytes indicate finger; 3-byte coords: X_hi,Y_hi,X_lo|Y_lo. 12-bit X/Y. */
 #define C40_TOUCHPAD_WIDTH	1920
 #define C40_TOUCHPAD_HEIGHT	942
-/* Motion: bytes 10-12 = poll counter; 13-24 = gyro[3]+accel[3] as __le16 (DS4 order). */
+/* Motion: bytes 10-12 = poll counter; 13-24 = gyro[3]+accel[3] as __le16 (DS4-compatible order). */
 #define C40_MOTION_OFFSET	13
-#define DS4_ACC_RES_PER_G	1024
-#define DS4_ACC_RANGE		(4 * DS4_ACC_RES_PER_G)
-#define DS4_GYRO_RES_PER_DEG_S	16
-#define DS4_GYRO_RANGE		(2048 * DS4_GYRO_RES_PER_DEG_S)
+#define C40_ACC_RES_PER_G	1024
+#define C40_ACC_RANGE		(4 * C40_ACC_RES_PER_G)
+#define C40_GYRO_RES_PER_DEG_S	16
+#define C40_GYRO_RANGE		(2048 * C40_GYRO_RES_PER_DEG_S)
+
+#define C40_OUTPUT_REPORT_ID	0x05
+#define C40_OUTPUT_REPORT_SIZE	32
+#define C40_OUTPUT_VALID_MOTOR	0x01
 
 struct c40_device {
-	struct ps_device base;
+	struct c40_base_device base;
 	struct input_dev *gamepad;
 	struct input_dev *sensors;
 	struct input_dev *touchpad;
-	struct ps_calibration_data accel_calib_data[3];
-	struct ps_calibration_data gyro_calib_data[3];
+	struct c40_calibration_data accel_calib_data[3];
+	struct c40_calibration_data gyro_calib_data[3];
+	uint8_t motor_left;
+	uint8_t motor_right;
+	u8 output_report_buf[C40_OUTPUT_REPORT_SIZE];
+	struct work_struct rumble_work;
 };
-/*
- * Common gamepad buttons across DualShock 3 / 4 and DualSense.
- * Note: for device with a touchpad, touchpad button is not included
- *        as it will be part of the touchpad device.
- */
-static const int ps_gamepad_buttons[] = {
-	BTN_WEST, /* Square */
-	BTN_NORTH, /* Triangle */
-	BTN_EAST, /* Circle */
-	BTN_SOUTH, /* Cross */
-	BTN_TL, /* L1 */
-	BTN_TR, /* R1 */
-	BTN_TL2, /* L2 */
-	BTN_TR2, /* R2 */
-	BTN_SELECT, /* Create (PS5) / Share (PS4) */
-	BTN_START, /* Option */
-	BTN_THUMBL, /* L3 */
-	BTN_THUMBR, /* R3 */
-	BTN_MODE, /* PS Home */
+
+static const int c40_gamepad_buttons[] = {
+	BTN_WEST, BTN_NORTH, BTN_EAST, BTN_SOUTH,
+	BTN_TL, BTN_TR, BTN_TL2, BTN_TR2,
+	BTN_SELECT, BTN_START, BTN_THUMBL, BTN_THUMBR, BTN_MODE,
 };
-static const struct {int x; int y; } ps_gamepad_hat_mapping[] = {
+static const struct { int x; int y; } c40_hat_mapping[] = {
 	{0, -1}, {1, -1}, {1, 0}, {1, 1}, {0, 1}, {-1, 1}, {-1, 0}, {-1, -1},
 	{0, 0},
 };
-/*
- * Add a new ps_device to ps_devices if it doesn't exist.
- * Return error on duplicate device, which can happen if the same
- * device is connected using both Bluetooth and USB.
- */
-static int c40_devices_list_add(struct ps_device *dev)
+
+static int c40_devices_list_add(struct c40_base_device *dev)
 {
-	struct ps_device *entry;
+	struct c40_base_device *entry;
 	mutex_lock(&c40_devices_lock);
 	list_for_each_entry(entry, &c40_devices_list, list) {
 		if (!memcmp(entry->mac_address, dev->mac_address, sizeof(dev->mac_address))) {
@@ -108,14 +100,14 @@ static int c40_devices_list_add(struct ps_device *dev)
 	mutex_unlock(&c40_devices_lock);
 	return 0;
 }
-static int c40_devices_list_remove(struct ps_device *dev)
+static int c40_devices_list_remove(struct c40_base_device *dev)
 {
 	mutex_lock(&c40_devices_lock);
 	list_del(&dev->list);
 	mutex_unlock(&c40_devices_lock);
 	return 0;
 }
-static int c40_device_set_player_id(struct ps_device *dev)
+static int c40_device_set_player_id(struct c40_base_device *dev)
 {
 	int ret = ida_alloc(&c40_player_id_allocator, GFP_KERNEL);
 	if (ret < 0)
@@ -123,12 +115,12 @@ static int c40_device_set_player_id(struct ps_device *dev)
 	dev->player_id = ret;
 	return 0;
 }
-static void c40_device_release_player_id(struct ps_device *dev)
+static void c40_device_release_player_id(struct c40_base_device *dev)
 {
 	ida_free(&c40_player_id_allocator, dev->player_id);
 	dev->player_id = U32_MAX;
 }
-static struct input_dev *ps_allocate_input_dev(struct hid_device *hdev, const char *name_suffix)
+static struct input_dev *c40_allocate_input_dev(struct hid_device *hdev, const char *name_suffix)
 {
 	struct input_dev *input_dev;
 	input_dev = devm_input_allocate_device(&hdev->dev);
@@ -150,17 +142,17 @@ static struct input_dev *ps_allocate_input_dev(struct hid_device *hdev, const ch
 	input_set_drvdata(input_dev, hdev);
 	return input_dev;
 }
-static enum power_supply_property ps_power_supply_props[] = {
+static enum power_supply_property c40_power_supply_props[] = {
 	POWER_SUPPLY_PROP_STATUS,
 	POWER_SUPPLY_PROP_PRESENT,
 	POWER_SUPPLY_PROP_CAPACITY,
 	POWER_SUPPLY_PROP_SCOPE,
 };
-static int ps_battery_get_property(struct power_supply *psy,
+static int c40_battery_get_property(struct power_supply *psy,
 		enum power_supply_property psp,
 		union power_supply_propval *val)
 {
-	struct ps_device *dev = power_supply_get_drvdata(psy);
+	struct c40_base_device *dev = power_supply_get_drvdata(psy);
 	uint8_t battery_capacity;
 	int battery_status;
 	unsigned long flags;
@@ -188,15 +180,15 @@ static int ps_battery_get_property(struct power_supply *psy,
 	}
 	return ret;
 }
-static int ps_device_register_battery(struct ps_device *dev)
+static int c40_register_battery(struct c40_base_device *dev)
 {
 	struct power_supply *battery;
 	struct power_supply_config battery_cfg = { .drv_data = dev };
 	int ret;
 	dev->battery_desc.type = POWER_SUPPLY_TYPE_BATTERY;
-	dev->battery_desc.properties = ps_power_supply_props;
-	dev->battery_desc.num_properties = ARRAY_SIZE(ps_power_supply_props);
-	dev->battery_desc.get_property = ps_battery_get_property;
+	dev->battery_desc.properties = c40_power_supply_props;
+	dev->battery_desc.num_properties = ARRAY_SIZE(c40_power_supply_props);
+	dev->battery_desc.get_property = c40_battery_get_property;
 	dev->battery_desc.name = devm_kasprintf(&dev->hdev->dev, GFP_KERNEL,
 			"astroc40-battery-%pMR", dev->mac_address);
 	if (!dev->battery_desc.name)
@@ -215,13 +207,13 @@ static int ps_device_register_battery(struct ps_device *dev)
 	}
 	return 0;
 }
-static struct input_dev *ps_gamepad_create(struct hid_device *hdev,
+static struct input_dev *c40_gamepad_create(struct hid_device *hdev,
 		int (*play_effect)(struct input_dev *, void *, struct ff_effect *))
 {
 	struct input_dev *gamepad;
 	unsigned int i;
 	int ret;
-	gamepad = ps_allocate_input_dev(hdev, NULL);
+	gamepad = c40_allocate_input_dev(hdev, NULL);
 	if (IS_ERR(gamepad))
 		return ERR_CAST(gamepad);
 	input_set_abs_params(gamepad, ABS_X, 0, 255, 0, 0);
@@ -232,25 +224,28 @@ static struct input_dev *ps_gamepad_create(struct hid_device *hdev,
 	input_set_abs_params(gamepad, ABS_RZ, 0, 255, 0, 0);
 	input_set_abs_params(gamepad, ABS_HAT0X, -1, 1, 0, 0);
 	input_set_abs_params(gamepad, ABS_HAT0Y, -1, 1, 0, 0);
-	for (i = 0; i < ARRAY_SIZE(ps_gamepad_buttons); i++)
-		input_set_capability(gamepad, EV_KEY, ps_gamepad_buttons[i]);
-#if IS_ENABLED(CONFIG_PLAYSTATION_FF)
+	for (i = 0; i < ARRAY_SIZE(c40_gamepad_buttons); i++)
+		input_set_capability(gamepad, EV_KEY, c40_gamepad_buttons[i]);
 	if (play_effect) {
 		input_set_capability(gamepad, EV_FF, FF_RUMBLE);
-		input_ff_create_memless(gamepad, NULL, play_effect);
+		ret = input_ff_create_memless(gamepad, NULL, play_effect);
+		if (ret) {
+			hid_err(hdev, "Failed to create FF device: %d\n", ret);
+			return ERR_PTR(ret);
+		}
 	}
-#endif
 	ret = input_register_device(gamepad);
 	if (ret)
 		return ERR_PTR(ret);
 	return gamepad;
 }
-static struct input_dev *ps_sensors_create(struct hid_device *hdev, int accel_range, int accel_res,
+
+static struct input_dev *c40_sensors_create(struct hid_device *hdev, int accel_range, int accel_res,
 		int gyro_range, int gyro_res)
 {
 	struct input_dev *sensors;
 	int ret;
-	sensors = ps_allocate_input_dev(hdev, "Motion Sensors");
+	sensors = c40_allocate_input_dev(hdev, "Motion Sensors");
 	if (IS_ERR(sensors))
 		return ERR_CAST(sensors);
 	__set_bit(INPUT_PROP_ACCELEROMETER, sensors->propbit);
@@ -275,12 +270,12 @@ static struct input_dev *ps_sensors_create(struct hid_device *hdev, int accel_ra
 		return ERR_PTR(ret);
 	return sensors;
 }
-static struct input_dev *ps_touchpad_create(struct hid_device *hdev, int width, int height,
+static struct input_dev *c40_touchpad_create(struct hid_device *hdev, int width, int height,
 		unsigned int num_contacts)
 {
 	struct input_dev *touchpad;
 	int ret;
-	touchpad = ps_allocate_input_dev(hdev, "Touchpad");
+	touchpad = c40_allocate_input_dev(hdev, "Touchpad");
 	if (IS_ERR(touchpad))
 		return ERR_CAST(touchpad);
 	/* Map button underneath touchpad to BTN_LEFT. */
@@ -298,36 +293,11 @@ static struct input_dev *ps_touchpad_create(struct hid_device *hdev, int width, 
 		return ERR_PTR(ret);
 	return touchpad;
 }
-static ssize_t firmware_version_show(struct device *dev,
-				struct device_attribute
-				*attr, char *buf)
-{
-	struct hid_device *hdev = to_hid_device(dev);
-	struct ps_device *ps_dev = hid_get_drvdata(hdev);
-	return sysfs_emit(buf, "0x%08x\n", ps_dev->fw_version);
-}
-static DEVICE_ATTR_RO(firmware_version);
-static ssize_t hardware_version_show(struct device *dev,
-				struct device_attribute
-				*attr, char *buf)
-{
-	struct hid_device *hdev = to_hid_device(dev);
-	struct ps_device *ps_dev = hid_get_drvdata(hdev);
-	return sysfs_emit(buf, "0x%08x\n", ps_dev->hw_version);
-}
-static DEVICE_ATTR_RO(hardware_version);
-static struct attribute *ps_device_attributes[] = {
-	&dev_attr_firmware_version.attr,
-	&dev_attr_hardware_version.attr,
-	NULL
-};
-static const struct attribute_group ps_device_attribute_group = {
-	.attrs = ps_device_attributes,
-};
-static int astroc40_parse_report(struct ps_device *ps_dev, struct hid_report *report,
+
+static int astroc40_parse_report(struct c40_base_device *c40_dev, struct hid_report *report,
 		u8 *data, int size)
 {
-	struct c40_device *c40 = container_of(ps_dev, struct c40_device, base);
+	struct c40_device *c40 = container_of(c40_dev, struct c40_device, base);
 	u8 hat, face, btn_lo, btn_hi;
 	u16 buttons;
 	u16 t0_x, t0_y, t1_x, t1_y;
@@ -344,12 +314,12 @@ static int astroc40_parse_report(struct ps_device *ps_dev, struct hid_report *re
 	input_report_abs(c40->gamepad, ABS_Z,  data[8]);
 	input_report_abs(c40->gamepad, ABS_RZ, data[9]);
 
-	/* Hat: C40 uses 0-7 for directions, 8=neutral. data[5] low nibble = hat, high nibble = face buttons */
+	/* Hat: C40 uses 0-7 for directions, 8=neutral */
 	hat = data[5] & 0x0f;
-	if (hat >= ARRAY_SIZE(ps_gamepad_hat_mapping))
+	if (hat >= ARRAY_SIZE(c40_hat_mapping))
 		hat = 8;
-	input_report_abs(c40->gamepad, ABS_HAT0X, ps_gamepad_hat_mapping[hat].x);
-	input_report_abs(c40->gamepad, ABS_HAT0Y, ps_gamepad_hat_mapping[hat].y);
+	input_report_abs(c40->gamepad, ABS_HAT0X, c40_hat_mapping[hat].x);
+	input_report_abs(c40->gamepad, ABS_HAT0Y, c40_hat_mapping[hat].y);
 
 	/* Face buttons: data[5] bits 4-7 (upper nibble). Order: bit4=NORTH,5=SOUTH,6=EAST,7=WEST; adjust if wrong */
 	face = data[5] >> 4;
@@ -429,10 +399,50 @@ static int astroc40_parse_report(struct ps_device *ps_dev, struct hid_report *re
 	return 0;
 }
 
-static struct ps_device *astroc40_create(struct hid_device *hdev)
+/*
+ * Rumble is sent from a work queue. The play_effect callback runs from
+ * timer/softirq context with spinlocks held - hid_hw_output_report() blocks
+ * on USB transfer, which would deadlock. Schedule work instead (see Wiimote).
+ */
+static void c40_rumble_worker(struct work_struct *work)
+{
+	struct c40_device *c40 = container_of(work, struct c40_device, rumble_work);
+	u8 *buf = c40->output_report_buf;
+	unsigned long flags;
+
+	spin_lock_irqsave(&c40->base.lock, flags);
+	memset(buf, 0, C40_OUTPUT_REPORT_SIZE);
+	buf[0] = C40_OUTPUT_REPORT_ID;
+	buf[1] = C40_OUTPUT_VALID_MOTOR;
+	buf[4] = c40->motor_right;
+	buf[5] = c40->motor_left;
+	spin_unlock_irqrestore(&c40->base.lock, flags);
+
+	hid_hw_output_report(c40->base.hdev, buf, C40_OUTPUT_REPORT_SIZE);
+}
+
+static int astroc40_play_effect(struct input_dev *dev, void *data, struct ff_effect *effect)
+{
+	struct hid_device *hdev = input_get_drvdata(dev);
+	struct c40_device *c40 = hid_get_drvdata(hdev);
+	unsigned long flags;
+
+	if (effect->type != FF_RUMBLE)
+		return 0;
+
+	spin_lock_irqsave(&c40->base.lock, flags);
+	c40->motor_left = effect->u.rumble.strong_magnitude / 256;
+	c40->motor_right = effect->u.rumble.weak_magnitude / 256;
+	spin_unlock_irqrestore(&c40->base.lock, flags);
+
+	schedule_work(&c40->rumble_work);
+	return 0;
+}
+
+static struct c40_base_device *astroc40_create(struct hid_device *hdev)
 {
 	struct c40_device *c40;
-	struct ps_device *ps_dev;
+	struct c40_base_device *base;
 	static atomic_t c40_mac_counter = ATOMIC_INIT(0);
 	int ret;
 
@@ -440,104 +450,104 @@ static struct ps_device *astroc40_create(struct hid_device *hdev)
 	if (!c40)
 		return ERR_PTR(-ENOMEM);
 
-	ps_dev = &c40->base;
-	ps_dev->hdev = hdev;
-	spin_lock_init(&ps_dev->lock);
-	ps_dev->battery_capacity = 0;
-	ps_dev->battery_status = POWER_SUPPLY_STATUS_UNKNOWN;
-	ps_dev->parse_report = astroc40_parse_report;
+	base = &c40->base;
+	base->hdev = hdev;
+	spin_lock_init(&base->lock);
+	base->battery_capacity = 0;
+	base->battery_status = POWER_SUPPLY_STATUS_UNKNOWN;
+	base->parse_report = astroc40_parse_report;
 
 	/* Synthetic MAC; C40 does not support Sony feature reports */
-	ps_dev->mac_address[0] = 0x02;
-	ps_dev->mac_address[1] = 0x98;
-	ps_dev->mac_address[2] = 0x86;
-	ps_dev->mac_address[3] = (hdev->product >> 8) & 0xff;
-	ps_dev->mac_address[4] = hdev->product & 0xff;
-	ps_dev->mac_address[5] = atomic_inc_return(&c40_mac_counter) & 0xff;
-	snprintf(hdev->uniq, sizeof(hdev->uniq), "%pMR", ps_dev->mac_address);
+	base->mac_address[0] = 0x02;
+	base->mac_address[1] = 0x98;
+	base->mac_address[2] = 0x86;
+	base->mac_address[3] = (hdev->product >> 8) & 0xff;
+	base->mac_address[4] = hdev->product & 0xff;
+	base->mac_address[5] = atomic_inc_return(&c40_mac_counter) & 0xff;
+	snprintf(hdev->uniq, sizeof(hdev->uniq), "%pMR", base->mac_address);
 
-	/* Override device name for "Astro C40 TR" branding */
 	strscpy(hdev->name, C40_DEVICE_NAME, sizeof(hdev->name));
 
 	/* Default calibration: passthrough (C40 has no calibration feature report) */
 	c40->gyro_calib_data[0].abs_code = ABS_RX;
 	c40->gyro_calib_data[0].sens_denom = S16_MAX;
-	c40->gyro_calib_data[0].sens_numer = DS4_GYRO_RANGE;
+	c40->gyro_calib_data[0].sens_numer = C40_GYRO_RANGE;
 	c40->gyro_calib_data[1].abs_code = ABS_RY;
 	c40->gyro_calib_data[1].sens_denom = S16_MAX;
-	c40->gyro_calib_data[1].sens_numer = DS4_GYRO_RANGE;
+	c40->gyro_calib_data[1].sens_numer = C40_GYRO_RANGE;
 	c40->gyro_calib_data[2].abs_code = ABS_RZ;
 	c40->gyro_calib_data[2].sens_denom = S16_MAX;
-	c40->gyro_calib_data[2].sens_numer = DS4_GYRO_RANGE;
+	c40->gyro_calib_data[2].sens_numer = C40_GYRO_RANGE;
 	c40->accel_calib_data[0].abs_code = ABS_X;
 	c40->accel_calib_data[0].sens_denom = S16_MAX;
-	c40->accel_calib_data[0].sens_numer = DS4_ACC_RANGE;
+	c40->accel_calib_data[0].sens_numer = C40_ACC_RANGE;
 	c40->accel_calib_data[1].abs_code = ABS_Y;
 	c40->accel_calib_data[1].sens_denom = S16_MAX;
-	c40->accel_calib_data[1].sens_numer = DS4_ACC_RANGE;
+	c40->accel_calib_data[1].sens_numer = C40_ACC_RANGE;
 	c40->accel_calib_data[2].abs_code = ABS_Z;
 	c40->accel_calib_data[2].sens_denom = S16_MAX;
-	c40->accel_calib_data[2].sens_numer = DS4_ACC_RANGE;
+	c40->accel_calib_data[2].sens_numer = C40_ACC_RANGE;
 
 	hid_set_drvdata(hdev, c40);
+	INIT_WORK(&c40->rumble_work, c40_rumble_worker);
 
-	ret = c40_devices_list_add(ps_dev);
+	ret = c40_devices_list_add(base);
 	if (ret)
 		return ERR_PTR(ret);
 
-	c40->gamepad = ps_gamepad_create(hdev, NULL);
+	c40->gamepad = c40_gamepad_create(hdev, astroc40_play_effect);
 	if (IS_ERR(c40->gamepad)) {
 		ret = PTR_ERR(c40->gamepad);
 		goto err;
 	}
 
-	c40->sensors = ps_sensors_create(hdev, DS4_ACC_RANGE, DS4_ACC_RES_PER_G,
-					 DS4_GYRO_RANGE, DS4_GYRO_RES_PER_DEG_S);
+	c40->sensors = c40_sensors_create(hdev, C40_ACC_RANGE, C40_ACC_RES_PER_G,
+					  C40_GYRO_RANGE, C40_GYRO_RES_PER_DEG_S);
 	if (IS_ERR(c40->sensors)) {
 		ret = PTR_ERR(c40->sensors);
 		goto err;
 	}
 
-	c40->touchpad = ps_touchpad_create(hdev, C40_TOUCHPAD_WIDTH, C40_TOUCHPAD_HEIGHT, 2);
+	c40->touchpad = c40_touchpad_create(hdev, C40_TOUCHPAD_WIDTH, C40_TOUCHPAD_HEIGHT, 2);
 	if (IS_ERR(c40->touchpad)) {
 		ret = PTR_ERR(c40->touchpad);
 		goto err;
 	}
 
-	ret = ps_device_register_battery(ps_dev);
+	ret = c40_register_battery(base);
 	if (ret)
 		goto err;
 
-	ret = c40_device_set_player_id(ps_dev);
+	ret = c40_device_set_player_id(base);
 	if (ret) {
-		hid_err(hdev, "Failed to assign player id for Astro C40: %d\n", ret);
+		hid_err(hdev, "Failed to assign player id: %d\n", ret);
 		goto err;
 	}
 
 	hid_info(hdev, "Registered " C40_DEVICE_NAME " controller\n");
-	return &c40->base;
+	return base;
 
 err:
-	c40_devices_list_remove(ps_dev);
+	c40_devices_list_remove(base);
 	return ERR_PTR(ret);
 }
 
-static int ps_raw_event(struct hid_device *hdev, struct hid_report *report,
+static int astroc40_raw_event(struct hid_device *hdev, struct hid_report *report,
 		u8 *data, int size)
 {
-	struct ps_device *dev = hid_get_drvdata(hdev);
+	struct c40_base_device *dev = hid_get_drvdata(hdev);
 	if (dev && dev->parse_report)
 		return dev->parse_report(dev, report, data, size);
 	return 0;
 }
-#define C40_HID_INTERFACE	4	/* C40 has HID on interfaces 3 and 4; use 4 only for inputs */
 
-static int ps_probe(struct hid_device *hdev, const struct hid_device_id *id)
+#define C40_HID_INTERFACE	4	/* C40 has HID on interfaces 3 and 4; bind only to 4 */
+
+static int astroc40_probe(struct hid_device *hdev, const struct hid_device_id *id)
 {
-	struct ps_device *dev;
+	struct c40_base_device *dev;
 	int ret;
 
-	/* C40 is USB composite: interfaces 3 and 4 are both gamepad HID. Bind only to 3. */
 	if (hdev->bus == BUS_USB) {
 		struct usb_interface *intf = to_usb_interface(hdev->dev.parent);
 		if (intf->cur_altsetting->desc.bInterfaceNumber != C40_HID_INTERFACE)
@@ -561,27 +571,23 @@ static int ps_probe(struct hid_device *hdev, const struct hid_device_id *id)
 	}
 	dev = astroc40_create(hdev);
 	if (IS_ERR(dev)) {
-		hid_err(hdev, "Failed to create Astro C40.\n");
 		ret = PTR_ERR(dev);
 		goto err_close;
 	}
-	ret = devm_device_add_group(&hdev->dev, &ps_device_attribute_group);
-	if (ret) {
-		hid_err(hdev, "Failed to register sysfs nodes.\n");
-		goto err_close;
-	}
-	return ret;
+	return 0;
 err_close:
 	hid_hw_close(hdev);
 err_stop:
 	hid_hw_stop(hdev);
 	return ret;
 }
-static void ps_remove(struct hid_device *hdev)
+
+static void astroc40_remove(struct hid_device *hdev)
 {
-	struct ps_device *dev = hid_get_drvdata(hdev);
-	c40_devices_list_remove(dev);
-	c40_device_release_player_id(dev);
+	struct c40_device *c40 = hid_get_drvdata(hdev);
+	cancel_work_sync(&c40->rumble_work);
+	c40_devices_list_remove(&c40->base);
+	c40_device_release_player_id(&c40->base);
 	hid_hw_close(hdev);
 	hid_hw_stop(hdev);
 }
@@ -594,9 +600,9 @@ MODULE_DEVICE_TABLE(hid, astroc40_devices);
 static struct hid_driver astroc40_driver = {
 	.name		= "astroc40",
 	.id_table	= astroc40_devices,
-	.probe		= ps_probe,
-	.remove		= ps_remove,
-	.raw_event	= ps_raw_event,
+	.probe		= astroc40_probe,
+	.remove		= astroc40_remove,
+	.raw_event	= astroc40_raw_event,
 };
 static int __init astroc40_init(void)
 {
